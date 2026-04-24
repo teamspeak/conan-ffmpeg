@@ -5,7 +5,7 @@ sources:
       # Order of preference: local (if found) > commit > tag/branch
       "local": "ffmpeg"
       # "commit": "140fd653aed8cad774f991ba083e2d01e86420c7"
-      "tag": "n8.0"
+      "tag": "n8.1"
     "amf":
       "local": 'amf'
       # "commit": "16f7d73e0b45c473e903e46981ed0b91efc4c091"
@@ -18,10 +18,10 @@ sources:
       "tag": 'vulkan-sdk-1.4.313'
     "libvpl":
       "local": "libvpl"
-      "tag": "v2.15.0"
+      "tag": "v2.16.0"
     "libva":
       "local": "libva"
-      "commit": "4c8971cdeb1a9d2243d2a78a7bc0e1a04ec0a8c9" # commit to support VA-API 1.23 on rolling releases
+      "commit": "ad64eb9b616d1b66afaf4cb9f0ea0b8e0ec1169c" # commit to support VA-API 1.23 on rolling releases
       # "tag": "2.22.0"
     "libvdpau":
       "local": "libvdpau"
@@ -49,6 +49,33 @@ sources:
     "libva":
       "local": "libva"
       "commit": "4c8971cdeb1a9d2243d2a78a7bc0e1a04ec0a8c9" # commit to support VA-API 1.23 on rolling releases
+      # "tag": "2.22.0"
+    "libvdpau":
+      "local": "libvdpau"
+      "tag": "1.5"
+  "v6.0.0-beta4":
+    "local_root": '/path/to/local/sources/' # e.g. extraced from the Release Assets, or pulled individually.
+    "ffmpeg":
+      # Order of preference: local (if found) > commit > tag/branch
+      "local": "ffmpeg"
+      # "commit": "140fd653aed8cad774f991ba083e2d01e86420c7"
+      "tag": "n8.1"
+    "amf":
+      "local": 'amf'
+      # "commit": "16f7d73e0b45c473e903e46981ed0b91efc4c091"
+      "tag": "v1.4.36"
+    "nvcodecheaders":
+      "local": 'nvcodecheaders'
+      "tag": 'n12.2.72.0'
+    "vulkan":
+      "local": 'vulkan'
+      "tag": 'vulkan-sdk-1.4.313'
+    "libvpl":
+      "local": "libvpl"
+      "tag": "v2.16.0"
+    "libva":
+      "local": "libva"
+      "commit": "ad64eb9b616d1b66afaf4cb9f0ea0b8e0ec1169c" # commit to support VA-API 1.23 on rolling releases
       # "tag": "2.22.0"
     "libvdpau":
       "local": "libvdpau"

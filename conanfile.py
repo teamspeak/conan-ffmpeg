@@ -383,6 +383,13 @@ class ffmpeg(ConanFile):
         # vaapi (linux only) copy .so's for systems that don't have libva installed
         copy(self, "libva*.so.*", self._deps_lib_path(), os.path.join(self.package_folder, "lib"), keep_path=False)
         copy(self, "libva*.so", self._deps_lib_path(), os.path.join(self.package_folder, "lib"), keep_path=False)
+        # libva public headers (va/va.h, va/va_drm.h, ...): needed by consumers
+        # that call libva directly at build time (e.g. hw_probe/qsv_probe). We
+        # don't want to depend on libva-dev being installed on every build
+        # host.
+        if self.options.get_safe('with_vaapi'):
+            copy(self, "*.h", os.path.join(self._deps_include_path(), "va"),
+                 os.path.join(self.package_folder, "include", "va"), keep_path=True)
         copy(self, "libvdpau*.so.*", self._deps_lib_path(), os.path.join(self.package_folder, "lib"), keep_path=False)
         copy(self, "libvdpau*.so", self._deps_lib_path(), os.path.join(self.package_folder, "lib"), keep_path=False)
         # windows .dll and .lib for linker tables
@@ -480,6 +487,14 @@ class ffmpeg(ConanFile):
             avfilter.frameworks.append("AppKit")
         if self.options.get_safe("with_coreimage"):
             avfilter.frameworks.append("CoreImage")
+
+        # Headers-only component for consumers that dlopen FFmpeg at runtime
+        # (see teamspeak_client_lib's FFmpegDynamicLib). Exposes include_dirs
+        # only — no .libs, no system_libs, no frameworks, no requires — so
+        # consumers get the public headers without dragging any link flags
+        # into their link line.
+        headers = self.cpp_info.components["headers"]
+        headers.set_property("pkg_config_name", "libffmpeg_headers")
 
     @property
     def _ffmpeg_build_path(self):
@@ -1016,6 +1031,13 @@ class ffmpeg(ConanFile):
                 "--disable-mmx",
                 "--enable-debug",
             ])
+
+        if self.settings.os == "Macos":
+            # Install names default to the conan build-tree's absolute lib
+            # path, which makes the dylibs unusable outside that machine —
+            # and in particular breaks dlopen from the .app bundle. @rpath
+            # lets consumers resolve via their own LC_RPATH / @loader_path.
+            args.append("--install-name-dir=@rpath")
 
         # software codec cores + parsers
         # for codec in codecs:
