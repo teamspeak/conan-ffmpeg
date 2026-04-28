@@ -1,10 +1,10 @@
 # FFmpeg as used in TeamSpeak 6
-This repository provides a **Conan (1.x)** recipe that builds a **shared [FFmpeg](https://www.ffmpeg.org/) 8.0** (or a selected commit) focused on **hardware-accelerated encoding/decoding** for **Windows**, **Linux**, and **macOS**.  
+This repository provides a **Conan (1.x)** recipe that builds a **shared [FFmpeg](https://www.ffmpeg.org/) 8.0+** (or a selected commit) focused on **hardware-accelerated encoding/decoding** for **Windows**, **Linux**, and **macOS**.  
 The default configuration mirrors the FFmpeg shared library shipped with the [TeamSpeak 6 Client](https://teamspeak.com/en/) and enables **LGPL v3** components via `--enable-version3`. More information about FFmpeg and the licensing can be found  [here](https://www.ffmpeg.org/).
 The package exposes the FFmpeg libraries: `avcodec`, `avformat`, `avfilter`, `avutil`, `swscale`, `swresample`, as well as `libvpl` (Win/Linux), `libva` (Linux only) and `libvdpau` (Linux only).
 
 > [!NOTE]
-> **Client compatibility:** The [TeamSpeak 6 Client](https://teamspeak.com/en/) in a specific beta release is guaranteed to work with a FFmpeg build from this repository with the same version tag (e.g. v6.0.0-beta3). In general, the Client is compatible with **FFmpeg 7.1+** (earlier versions \< 7.1 **may** work but are not guaranteed). The versions in the `conandata.yml` represent public beta releases, however, not every beta release may contain an update of FFmpeg. So _v6.0.0-beta3_ could be valid for _v6.0.0-beta5_ as well. With each client release, a [release](/../../releases) with the exact sources will be generated for offline building. When updated, a new entry will appear in `conandata.yml` reflecting the changed sources.
+> **Client compatibility:** The [TeamSpeak 6 Client](https://teamspeak.com/en/) in a specific beta release is guaranteed to work with a FFmpeg build from this repository with the same version tag (e.g. v6.0.0-beta4). In general, the Client is compatible with **FFmpeg 7.1+** (earlier versions \< 7.1 **may** work but are not guaranteed). The versions in the `conandata.yml` represent public beta releases, however, not every beta release may contain an update of FFmpeg. So _v6.0.0-beta3_ could be valid for _v6.0.0-beta5_ as well. With each client release, a [release](/../../releases) with the exact sources will be generated for offline building. When updated, a new entry will appear in `conandata.yml` reflecting the changed sources.
 
 
 ## 🧩 Capabilities & Compatibility
