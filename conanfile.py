@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 import traceback
 
 from conan.tools.cmake import CMakeToolchain, CMake
@@ -7,31 +8,23 @@ from conan.tools.env.environment import _EnvVarPlaceHolder, _EnvValue
 from conan.tools.microsoft import is_msvc, check_min_vs
 from conan.tools.scm import Git, Version
 from conan.tools.apple import is_apple_os
-from conans.client.subsystems import subsystem_path
-from conans.client.tools import SystemPackageTool, unix_path
-from conans.errors import ConanException
+from conan.internal.subsystems import subsystem_path
+from conan.tools.microsoft import unix_path
+from conan.tools.system.package_manager import Apt, PacMan
+from conan.errors import ConanException
+from conan.tools.build import cross_building
+from conan.tools.apple import fix_apple_shared_install_name
 
-try:
-    # Conan 2.x
-    from conan import __version__ as _conan_version
-except ImportError:
-    # Conan 1.x
-    from conans import __version__ as _conan_version
-
-from conans.tools import Version as _ConanVersion, cross_building
-
-_is_conan_v2 = int(_ConanVersion(_conan_version).major) >= 2
 from conan import ConanFile
 from conan.tools.gnu import AutotoolsToolchain, AutotoolsDeps, Autotools, PkgConfigDeps
 from conan.tools.files.symlinks import absolute_to_relative_symlinks
-from conan.tools.files import copy
-from conans import tools
+from conan.tools.files import copy, chdir
 
 import os
 from pathlib import Path
 import re
 
-def _get_str_safe(self, placeholder, subsystem, pathsep):
+def _get_str_safe(self, placeholder, subsystem, pathsep, root_path=None, script_path=None):
     """
     :param subsystem:
     :param placeholder: a OS dependant string pattern of the previous env-var value like
@@ -45,13 +38,23 @@ def _get_str_safe(self, placeholder, subsystem, pathsep):
             if placeholder:
                 values.append(placeholder.format(name=self._name))
         else:
+            if v is None:
+                continue
             if self._path:
                 v = subsystem_path(subsystem, v)
-            values.append(v)
+                if root_path is not None:
+                    if v.startswith(root_path):
+                        v = v.replace(root_path, script_path, 1)
+                    elif os.sep == "\\":
+                        r = root_path.replace("\\", "/")
+                        if v.startswith(r):
+                            v = v.replace(r, script_path.replace("\\", "/"))
+            if v is not None:
+                values.append(v)
     if self._path:
-        return pathsep.join([val for val in values if val is not None])
+        return pathsep.join(values)
 
-    return self._sep.join([val for val in values if val is not None])
+    return self._sep.join(values)
 
 _EnvValue.get_str = _get_str_safe
 
@@ -72,7 +75,7 @@ class ffmpeg(ConanFile):
     description = 'FFmpeg (LGPL v3 build with HW-accelerated en/decoding only)'
     homepage = 'https://github.com/teamspeak/ffmpeg'
     settings = 'os', 'arch', 'compiler', 'build_type'
-    package_type = 'library'
+    package_type = 'shared-library'
     exports_sources = 'patches/*'
     topics = topics = ('ffmpeg', 'multimedia', 'video', 'audio', 'hwaccel', 'vaapi', 'nvdec', 'qsv', 'vdpau', 'amf')
     win_bash = True
@@ -100,6 +103,7 @@ class ffmpeg(ConanFile):
         "with_mediacodec": [True, False],
 
         "with_strip":  [True, False],
+        "with_symbols": [True, False],
 
     }
     default_options = {
@@ -128,6 +132,7 @@ class ffmpeg(ConanFile):
         "with_mediacodec": False,
 
         "with_strip": False,
+        "with_symbols": False,
     }
 
 
@@ -144,16 +149,22 @@ class ffmpeg(ConanFile):
     def config_options(self):
         if self.settings.os == "Windows":
             del self.options.fPIC
-        if self.settings.os not in ["Linux", "FreeBSD"] or self._is_cross_build:
+        if self.settings.os not in ["Linux", "FreeBSD"] or cross_building(self):
             del self.options.with_vaapi
             del self.options.with_vdpau
             del self.options.with_vulkan
-            del self.options.with_xcb
-            del self.options.with_libalsa
-            del self.options.with_pulse
-            del self.options.with_xlib
             del self.options.with_libdrm
             del self.options.with_v4l
+            # TODO: VAAPI/VDPAU are disabled during cross-compilation because this recipe builds
+            # libva and libvdpau from source (see _setup_vaapi() and _setup_vdpau()), but those
+            # build methods don't configure cross-compilation toolchains (autogen.sh/meson have no
+            # --host/--target flags set). To enable cross-compilation support, would need to:
+            # 1. Pass cross-compilation toolchain to autotools/meson
+            # 2. Set up target sysroots and pkg-config paths
+            # 3. Configure host vs target architecture detection properly
+            if cross_building(self):
+                # nvenc requires vdpau for nvdec hw accel decoding, so disable it too when cross-compiling
+                del self.options.with_nvenc
         if self.settings.os != "Macos":
             del self.options.with_appkit
         if self.settings.os not in ["Macos", "iOS", "tvOS"]:
@@ -165,18 +176,18 @@ class ffmpeg(ConanFile):
         else:
             del self.options.with_qsv
             del self.options.with_amf
-            del self.options.with_nvenc
+            self.options.rm_safe("with_nvenc")
             if str(self.settings.arch).startswith("armv8"):
                 del self.options.with_asm
         if not self.settings.os == "Android":
-            del self.options.with_jni
             del self.options.with_mediacodec
-        if self.settings.os == "Android":
-            del self.options.with_libfdk_aac
         if self.options.get_safe('shared'):
             self.options.rm_safe("fPIC")
         if self.settings.os in ["Linux", "FreeBSD"] and self.options.get_safe('with_nvenc') and not self.options.get_safe('with_vdpau'):
             raise ConanException("option 'with_nvenc' needs 'with_vdpau' to be turned on (for nvdec hw accel decoding)")
+
+        if self.options.get_safe("with_symbols", False) and self.options.get_safe("with_strip", False):
+            raise ConanException("with_symbols=True cannot be combined with with_strip=True")
 
     def build_requirements(self):
         # assembler
@@ -185,37 +196,47 @@ class ffmpeg(ConanFile):
         if self.settings.os in ["Linux", "FreeBSD"]:
             if self.options.get_safe("with_libdrm"):
                 self.tool_requires("libdrm/2.4.119")
+        if self.settings_build.os == "Windows": # Note: we always do msys2 in this recipe and not is_msvc(self)
+            self.win_bash = True
+            if not self.conf.get("tools.microsoft.bash:path", check_type=str):
+                self.tool_requires("msys2/cci.latest")
 
     def requirements(self):
         if self.options.get_safe("with_harfbuzz"):
             self.requires("harfbuzz/8.3.0")
 
     def package_id(self):
-        self.info.settings.build_type = "Release"
-        if self.settings.os == "Windows":
-            self.info.settings.compiler.runtime = "MT"
-        else:
-            self.info.settings.compiler.runtime = "static"
+        del self.info.settings.build_type
+        del self.info.settings.compiler
 
     def system_requirements(self):
-        installer = SystemPackageTool()
-        if self._is_cross_build or self.settings.os == "Linux":
+        if cross_building(self) or self.settings.os == "Linux":
+            apt = Apt(self)
             if self.options.get_safe("with_vaapi"):
-                # installer.install("libva2 libva-dev")
+                # apt.install(["libva2", "libva-dev"])
                 pass
             if self.options.get_safe("with_vdpau"):
-                # installer.install("libvdpau libvdpau-dev")
+                # apt.install(["libvdpau", "libvdpau-dev"])
                 pass
-            if self._is_cross_build and self.settings.os == "Windows":
-                installer.install("mingw-w64 mingw-w64-common mingw-w64-tools mingw-w64-x86-64-dev gcc-mingw-w64 gcc-mingw-w64-x86-64 g++-mingw-w64 g++-mingw-w64-x86-64")
-                pass
+            if cross_building(self) and self.settings.os == "Windows":
+                packages = [
+                    "mingw-w64",
+                    "mingw-w64-common",
+                    "mingw-w64-tools",
+                    "mingw-w64-x86-64-dev",
+                    "gcc-mingw-w64",
+                    "gcc-mingw-w64-x86-64",
+                    "g++-mingw-w64",
+                    "g++-mingw-w64-x86-64",
+                ]
+                apt.install(packages)
             else:
                 if self.options.get_safe("with_v4l"):
-                    # installer.install("libv4l-dev libv4l-0")
+                    # apt.install(["libv4l-dev", "libv4l-0"])
                     pass
         if self.settings.os == "Windows":
-            installer.install("make")
-        pass
+            pacman = PacMan(self)
+            pacman.install(["make"])
 
     def source(self):
         dst_path = Path(os.path.join(".", self.CHECKOUT_PATH_FFMPEG))
@@ -229,10 +250,13 @@ class ffmpeg(ConanFile):
         buildenv_vars = env.vars(self)
         buildenv_vars.save_script(vb._filename)
 
-        if not self._is_cross_build:
+        if not cross_building(self):
             env = VirtualRunEnv(self)
             env.generate()
 
+        if (self.settings.os == "Windows" and is_msvc(self)
+                and self.options.get_safe("with_symbols", False)):
+            self._patch_msvc_pdb_link_flags()
 
         args = self._get_configure_args()
         tc = self._create_toolchain()
@@ -242,10 +266,10 @@ class ffmpeg(ConanFile):
         self.output.info(f"{compilers_from_conf}")
         nm = buildenv_vars.get("NM")
         if nm:
-            args.append(f"--nm={unix_path(nm)}")
+            args.append(f"--nm={unix_path(self, nm)}")
         ar = buildenv_vars.get("AR")
         if ar:
-            args.append(f"--ar={unix_path(ar)}")
+            args.append(f"--ar={unix_path(self, ar)}")
         if self.options.get_safe('with_asm'):
             if is_apple_os(self):
                 asm = buildenv_vars.get("AS")
@@ -253,28 +277,28 @@ class ffmpeg(ConanFile):
             else:
                 asm = compilers_from_conf.get("asm", buildenv_vars.get("AS"))
             if asm:
-                args.append(f"--as={unix_path(asm)}")
+                args.append(f"--as={unix_path(self, asm)}")
         strip = buildenv_vars.get("STRIP")
         if strip:
-            args.append(f"--strip={unix_path(strip)}")
+            args.append(f"--strip={unix_path(self, strip)}")
         cc = compilers_from_conf.get("c", buildenv_vars.get("CC", self._default_compilers.get("cc")))
         if cc:
-            args.append(f"--cc={unix_path(cc)}")
+            args.append(f"--cc={unix_path(self, cc)}")
         cxx = compilers_from_conf.get("cpp", buildenv_vars.get("CXX", self._default_compilers.get("cxx")))
         if cxx:
-            args.append(f"--cxx={unix_path(cxx)}")
+            args.append(f"--cxx={unix_path(self, cxx)}")
         ld = buildenv_vars.get("LD")
         if ld:
-            args.append(f"--ld={unix_path(ld)}")
+            args.append(f"--ld={unix_path(self, ld)}")
         ranlib = buildenv_vars.get("RANLIB")
         if ranlib:
-            args.append(f"--ranlib={unix_path(ranlib)}")
+            args.append(f"--ranlib={unix_path(self, ranlib)}")
         pkg_config = self.conf.get("tools.gnu:pkg_config", default=buildenv_vars.get("PKG_CONFIG"), check_type=str)
         if pkg_config:
             # the ffmpeg configure script hardcodes the name of the executable,
             # unlike other tools that use the PKG_CONFIG environment variable
             # if we are aware the user has requested a specific pkg-config, we pass it to the configure script
-            args.append(f"--pkg-config={unix_path(pkg_config)}")
+            args.append(f"--pkg-config={unix_path(self, pkg_config)}")
         else:
             self._setup_msys2_pkgconfig()
         if is_msvc(self):
@@ -286,7 +310,7 @@ class ffmpeg(ConanFile):
             # Workaround for link error "ld: building exports trie: duplicate symbol '_av_ac3_parse_header'"
             # tc.extra_ldflags.append("-Wl,-ld_classic")
             pass
-        if self._is_cross_build:
+        if cross_building(self):
             if is_apple_os(self) and self.options.with_audiotoolbox:
                 args.append("--disable-outdev=audiotoolbox")
 
@@ -322,9 +346,9 @@ class ffmpeg(ConanFile):
                     cflags.extend(deps_cpp_info.cflags)
 
                 env = Environment()
-                env.append("CPPFLAGS", [f"-I{unix_path(p)}" for p in includedirs] + [f"-D{d}" for d in defines])
+                env.append("CPPFLAGS", [f"-I{unix_path(self, p)}" for p in includedirs] + [f"-D{d}" for d in defines])
                 env.append("_LINK_", [lib if lib.endswith(".lib") else f"{lib}.lib" for lib in libs])
-                env.append("LDFLAGS", [f"-LIBPATH:{unix_path(p)}" for p in libdirs] + linkflags)
+                env.append("LDFLAGS", [f"-LIBPATH:{unix_path(self, p)}" for p in libdirs] + linkflags)
                 env.append("CXXFLAGS", cxxflags)
                 env.append("CFLAGS", cflags)
                 env.vars(self).save_script("conanautotoolsdeps_cl_workaround")
@@ -355,7 +379,7 @@ class ffmpeg(ConanFile):
                 self._setup_vdpau()
 
             autotools = Autotools(self)
-            with tools.chdir(os.path.join(self.source_folder, self.CHECKOUT_PATH_FFMPEG)):
+            with chdir(self, os.path.join(self.source_folder, self.CHECKOUT_PATH_FFMPEG)):
                 try:
                     autotools.configure(build_script_folder=os.path.join(self.source_folder, self.CHECKOUT_PATH_FFMPEG))
                 except Exception as e:
@@ -364,19 +388,77 @@ class ffmpeg(ConanFile):
                 autotools.make()
                 autotools.install(args=["DESTDIR="])
 
+                # FFmpeg's MSVC shared-library links write the PDB beside the
+                # per-library build output.  The upstream install rules do
+                # not reliably copy those PDBs to the configured prefix, so
+                # preserve them explicitly for package().
+                if (self.settings.os == "Windows" and is_msvc(self)
+                        and self.options.get_safe("with_symbols", False)):
+                    install_bin = Path(self._ffmpeg_build_path, "bin")
+                    install_bin.mkdir(parents=True, exist_ok=True)
+                    for pdb in Path(self.source_folder, self.CHECKOUT_PATH_FFMPEG).rglob("*.pdb"):
+                        if not pdb.is_file():
+                            continue
+                        # vc*.pdb is the compiler-side intermediate PDB
+                        # produced by /Zi, not a DLL linker PDB.
+                        if pdb.name.lower().startswith("vc"):
+                            continue
+                        destination = install_bin / pdb.name
+                        if pdb.resolve() != destination.resolve():
+                            shutil.copy2(pdb, destination)
+
+    def _patch_msvc_pdb_link_flags(self):
+        """Give each MSVC FFmpeg DLL a distinct PDB in its build output."""
+        configure = Path(self.source_folder, self.CHECKOUT_PATH_FFMPEG, "configure")
+        text = configure.read_text(encoding="utf-8")
+        replacements = (
+            (
+                "SHFLAGS='-Wl,-dll -Wl,-def:$$(@:$(SLIBSUF)=.def) "
+                "-Wl,-implib:$(SUBDIR)$(SLIBNAME:$(SLIBSUF)=.lib)'",
+                "SHFLAGS='-Wl,-dll -Wl,-def:$$(@:$(SLIBSUF)=.def) "
+                "-Wl,-implib:$(SUBDIR)$(SLIBNAME:$(SLIBSUF)=.lib) "
+                "-Wl,-pdb:$$(@:$(SLIBSUF)=.pdb)'",
+            ),
+            (
+                "SHFLAGS='-dll -def:$$(@:$(SLIBSUF)=.def) "
+                "-implib:$(SUBDIR)$(SLIBNAME:$(SLIBSUF)=.lib)'",
+                "SHFLAGS='-dll -def:$$(@:$(SLIBSUF)=.def) "
+                "-implib:$(SUBDIR)$(SLIBNAME:$(SLIBSUF)=.lib) "
+                "-pdb:$$(@:$(SLIBSUF)=.pdb)'",
+            ),
+        )
+        for old, new in replacements:
+            if text.count(old) != 1:
+                raise ConanException(
+                    "Unable to add per-DLL PDB output to FFmpeg configure "
+                    f"(expected one MSVC SHFLAGS entry, found {text.count(old)})")
+            text = text.replace(old, new)
+        configure.write_text(text, encoding="utf-8")
+
     def package(self):
-        absolute_to_relative_symlinks(self,self._deps_lib_path())
-        absolute_to_relative_symlinks(self,os.path.join(self._ffmpeg_build_path, "lib"))
+        if self.options.get_safe("with_symbols", False):
+            self._verify_build_symbols()
+        absolute_to_relative_symlinks(self, self._deps_lib_path())
+        absolute_to_relative_symlinks(self, os.path.join(self._ffmpeg_build_path, "lib"))
         # all platforms: headers
-        self.copy("*.h", src=os.path.join(self._ffmpeg_build_path, "include"), dst="include", keep_path=True)
+        copy(self, "*.h", src=os.path.join(self._ffmpeg_build_path, "include"),
+             dst=os.path.join(self.package_folder, "include"), keep_path=True)
         if self.options.get_safe('with_amf'):
-            self.copy("*.h", src=os.path.join(self.build_path, self.DEPS_ROOT, "include", "AMF"), dst="include/AMF", keep_path=True)
+            copy(self, "*.h",
+                 src=os.path.join(self.build_folder, self.DEPS_ROOT, "include", "AMF"),
+                 dst=os.path.join(self.package_folder, "include", "AMF"), keep_path=True)
         if self.options.get_safe('with_nvenc'):
-            self.copy("*.h", src=os.path.join(self.build_path, self.DEPS_ROOT, "include", "ffnvcodec"), dst="include/ffnvcodec", keep_path=True)
+            copy(self, "*.h",
+                 src=os.path.join(self.build_folder, self.DEPS_ROOT, "include", "ffnvcodec"),
+                 dst=os.path.join(self.package_folder, "include", "ffnvcodec"), keep_path=True)
         if self.options.get_safe('with_qsv'):
-            self.copy("*.h", src=os.path.join(self.build_path, self.DEPS_ROOT, "include", "vpl"), dst="include/vpl", keep_path=True)
-            self.copy("*.a", src=os.path.join(self.build_path, self.DEPS_ROOT, "lib"), dst="lib", keep_path=False)
-            self.copy("*.lib", src=os.path.join(self.build_path, self.DEPS_ROOT, "lib"), dst="lib", keep_path=False)
+            copy(self, "*.h",
+                 src=os.path.join(self.build_folder, self.DEPS_ROOT, "include", "vpl"),
+                 dst=os.path.join(self.package_folder, "include", "vpl"), keep_path=True)
+            copy(self, "*.a", src=os.path.join(self.build_folder, self.DEPS_ROOT, "lib"),
+                 dst=os.path.join(self.package_folder, "lib"), keep_path=False)
+            copy(self, "*.lib", src=os.path.join(self.build_folder, self.DEPS_ROOT, "lib"),
+                 dst=os.path.join(self.package_folder, "lib"), keep_path=False)
         # linux .so
         copy(self, "*.so.*", os.path.join(self._ffmpeg_build_path, "lib"), os.path.join(self.package_folder, "lib"), keep_path=False)
         copy(self, "*.so", os.path.join(self._ffmpeg_build_path, "lib"), os.path.join(self.package_folder, "lib"), keep_path=False)
@@ -393,14 +475,83 @@ class ffmpeg(ConanFile):
         copy(self, "libvdpau*.so.*", self._deps_lib_path(), os.path.join(self.package_folder, "lib"), keep_path=False)
         copy(self, "libvdpau*.so", self._deps_lib_path(), os.path.join(self.package_folder, "lib"), keep_path=False)
         # windows .dll and .lib for linker tables
-        self.copy("*.dll", src=os.path.join(self._ffmpeg_build_path, "bin"), dst="bin", keep_path=False)
-        self.copy("*.dll.*", src=os.path.join(self._ffmpeg_build_path, "bin"), dst="bin", keep_path=False)
-        self.copy("*.pdb", src=os.path.join(self.source_folder, self.CHECKOUT_PATH_FFMPEG), dst="bin", keep_path=False)
-        self.copy("*.lib", src=os.path.join(self._ffmpeg_build_path, "bin"), dst="lib", keep_path=False)
+        copy(self, "*.dll", src=os.path.join(self._ffmpeg_build_path, "bin"),
+             dst=os.path.join(self.package_folder, "bin"), keep_path=False)
+        copy(self, "*.dll.*", src=os.path.join(self._ffmpeg_build_path, "bin"),
+             dst=os.path.join(self.package_folder, "bin"), keep_path=False)
+        # MSVC emits the PDBs next to the generated DLLs.  The source checkout
+        # is never a valid source for build symbols and may contain stale files.
+        if self.options.get_safe("with_symbols", False):
+            pdb_sources = [
+                os.path.join(self._ffmpeg_build_path, "bin"),
+                self._ffmpeg_build_path,
+            ]
+            for pdb_source in pdb_sources:
+                copy(self, "*.pdb", src=pdb_source,
+                     dst=os.path.join(self.package_folder, "bin"), keep_path=False,
+                     excludes="vc*.pdb")
+
+            if self.settings.os == "Windows":
+                dlls = list(Path(self._ffmpeg_build_path, "bin").glob("*.dll"))
+                pdbs = {path.stem.lower() for source in pdb_sources
+                        for path in Path(source).glob("*.pdb")
+                        if not path.name.lower().startswith("vc")}
+                missing = [dll.name for dll in dlls if dll.stem.lower() not in pdbs]
+                if missing:
+                    raise ConanException(
+                        "FFmpeg symbol build produced DLLs without matching PDBs: "
+                        + ", ".join(sorted(missing)))
+        copy(self, "*.lib", src=os.path.join(self._ffmpeg_build_path, "bin"),
+             dst=os.path.join(self.package_folder, "lib"), keep_path=False)
 
         # mac dylibs
-        self.copy("*.dylib", src=os.path.join(self._ffmpeg_build_path, "bin"), dst="lib", keep_path=False)
-        self.copy("*.dylib", src=os.path.join(self._ffmpeg_build_path, "lib"), dst="lib", keep_path=False)
+        # excludes=["*.dSYM/*"]: copy() recurses into subdirectories, and the
+        # dSYM bundle's inner DWARF companion is named identically to the real
+        # dylib (e.g. libavcodec.62.11.100.dylib) and also matches "*.dylib".
+        # Without the exclude, keep_path=False would flatten that DWARF file
+        # over the real dylib, shipping a dSYM companion instead of the library.
+        copy(self, "*.dylib", src=os.path.join(self._ffmpeg_build_path, "bin"),
+             dst=os.path.join(self.package_folder, "lib"), keep_path=False,
+             excludes=["*.dSYM/*"])
+        copy(self, "*.dylib", src=os.path.join(self._ffmpeg_build_path, "lib"),
+             dst=os.path.join(self.package_folder, "lib"), keep_path=False,
+             excludes=["*.dSYM/*"])
+        if self.options.get_safe("with_symbols", False) and self.settings.os == "Macos":
+            expected_dsyms = []
+            for symbol_source in (
+                    os.path.join(self._ffmpeg_build_path, "bin"),
+                    os.path.join(self._ffmpeg_build_path, "lib")):
+                # A dSYM is a directory bundle.  Conan's `copy("*.dSYM", ...)`
+                # only matches the directory entry and does not copy the bundle
+                # contents, leaving an apparently successful package with no
+                # usable symbols.  Copy each bundle recursively instead.
+                for dsym in Path(symbol_source).glob("*.dSYM"):
+                    if not dsym.is_dir():
+                        continue
+                    expected_dsyms.append(dsym.name)
+                    copy(self, "*", src=str(dsym),
+                         dst=os.path.join(self.package_folder, "lib", dsym.name),
+                         keep_path=True)
+
+            package_lib = Path(self.package_folder, "lib")
+            missing_dsyms = [name for name in expected_dsyms
+                             if not (package_lib / name / "Contents" / "Resources" /
+                                     "DWARF").is_dir()]
+            if missing_dsyms:
+                raise ConanException(
+                    "FFmpeg symbol packaging failed to copy dSYMs: "
+                    + ", ".join(sorted(missing_dsyms)))
+
+            # Strip the real, packaged dylibs (debug + local symbols only;
+            # exported symbols and LC_UUID are preserved) now that their dSYM
+            # companions are confirmed present, so the dSYMs stay matched.
+            # Top-level glob only: must not descend into the *.dSYM bundles
+            # just verified above.
+            strip_tool = shutil.which("strip") or "strip"
+            for dylib in package_lib.glob("*.dylib"):
+                if dylib.is_symlink():
+                    continue
+                subprocess.run([strip_tool, "-S", "-x", str(dylib)], check=True)
 
         # licenses (FFmpeg ships multiple COPYING* and LICENSE files)
         # usually, LGPLv3 is the correct one to consider without any changes to this conanfile.
@@ -410,6 +561,7 @@ class ffmpeg(ConanFile):
         copy(self, "COPYING*", src=os.path.join(self.source_folder, self.CHECKOUT_PATH_FFMPEG),
              dst=os.path.join(self.package_folder, "licenses"), keep_path=False)
 
+        fix_apple_shared_install_name(self)
 
     def package_info(self):
         def _add_component(name, dependencies):
@@ -498,20 +650,70 @@ class ffmpeg(ConanFile):
 
     @property
     def _ffmpeg_build_path(self):
-        return os.path.join(self.build_path, self.BUILD_PATH)
+        return os.path.join(self.build_folder, self.BUILD_PATH)
+
+    def _verify_build_symbols(self):
+        """Fail before packaging if the requested symbols were stripped."""
+        if self.settings.os == "Windows":
+            # MSVC emits one PDB beside each generated DLL.  The detailed
+            # per-DLL check below also catches partial FFmpeg builds.
+            if not is_msvc(self):
+                return
+            dll_dir = Path(self._ffmpeg_build_path, "bin")
+            pdbs = {path.stem.lower() for path in dll_dir.glob("*.pdb")}
+            missing = [dll.name for dll in dll_dir.glob("*.dll")
+                       if dll.stem.lower() not in pdbs]
+            if missing:
+                raise ConanException(
+                    "FFmpeg symbol build produced DLLs without matching PDBs: "
+                    + ", ".join(sorted(missing)))
+            return
+
+        if self.settings.os in ("Linux", "Android"):
+            binaries = [path for path in Path(self._ffmpeg_build_path, "lib").glob("*.so*")
+                        if path.is_file() and not path.is_symlink()]
+            readelf = shutil.which("llvm-readelf") or shutil.which("readelf")
+            if not readelf:
+                raise ConanException("with_symbols=True requires llvm-readelf or readelf")
+            missing = []
+            for binary in binaries:
+                result = subprocess.run([readelf, "-S", str(binary)],
+                                        capture_output=True, text=True, check=True)
+                if ".debug_info" not in result.stdout:
+                    missing.append(binary.name)
+            if missing:
+                raise ConanException(
+                    "FFmpeg symbol build produced ELF libraries without DWARF: "
+                    + ", ".join(sorted(missing)))
+            return
+
+        if self.settings.os == "Macos":
+            binaries = [path for root in ("bin", "lib")
+                        for path in Path(self._ffmpeg_build_path, root).glob("*.dylib")
+                        if path.is_file() and not path.is_symlink()]
+            dsymutil = shutil.which("dsymutil")
+            if not dsymutil:
+                raise ConanException("with_symbols=True requires dsymutil")
+            missing = []
+            for binary in binaries:
+                dsym = Path(str(binary) + ".dSYM")
+                subprocess.run([dsymutil, str(binary), "-o", str(dsym)], check=True)
+                dwarf_dir = dsym / "Contents" / "Resources" / "DWARF"
+                if not dwarf_dir.is_dir() or not any(item.is_file() for item in dwarf_dir.iterdir()):
+                    missing.append(binary.name)
+            if missing:
+                raise ConanException(
+                    "FFmpeg symbol build produced Mach-O libraries without dSYMs: "
+                    + ", ".join(sorted(missing)))
 
     @property
     def _deps_root(self):
         return os.path.join(self.source_folder, self.DEPS_ROOT)
 
     @property
-    def _is_cross_build(self):
-        return cross_building(self)
-
-    @property
     def _target_os(self):
         if self.settings.os == "Windows":
-            return "mingw32" if self._is_cross_build == "gcc" else "win32"
+            return "win32" if is_msvc(self) else "mingw32"
         elif is_apple_os(self):
             return "darwin"
 
@@ -544,7 +746,6 @@ class ffmpeg(ConanFile):
         elif is_msvc(self):
             return {"cc": "cl.exe", "cxx": "cl.exe"}
         return {}
-
 
     def _get_local_source(self, component: DependenyComponent, target_path: Path):
         cd = self.conan_data["sources"][self.version]
@@ -609,7 +810,7 @@ class ffmpeg(ConanFile):
         clone_args = ['-n']
         if sparse_patterns:
             clone_args.append('--filter=tree:0')
-        with tools.chdir(target_path.absolute()):
+        with chdir(self, target_path.absolute()):
             if not use_commit:
                 clone_args.extend(['-b', comp['tag'], '--depth', '1'])
             git.clone(url=repo, target=".", args=clone_args)
@@ -623,7 +824,6 @@ class ffmpeg(ConanFile):
                 git.run('checkout')
 
         return True
-
 
     def _get_source(self, component: DependenyComponent, target_path: Path):
         if self._get_local_source(component, target_path):
@@ -749,25 +949,40 @@ class ffmpeg(ConanFile):
         return tc
 
     def _get_cflags(self):
-        cflags = [f'-I{unix_path(self._deps_include_path())}']
+        cflags = [f'-I{unix_path(self, self._deps_include_path())}']
         if self.options.get_safe("with_qsv"):
-            cflags.append(f'-I{unix_path(os.path.join(self._deps_include_path(), "vpl"))}')
-        if self._is_cross_build:
+            cflags.append(f'-I{unix_path(self, os.path.join(self._deps_include_path(), "vpl"))}')
+        if cross_building(self):
             cflags.append("-D_FORTIFY_SOURCE=0")
             cflags.append("-U_FORTIFY_SOURCE")
+        if self.options.get_safe("with_symbols", False):
+            # The recipe runs through an MSYS2 bash shell on Windows.  MSYS2
+            # treats slash-prefixed arguments as paths, so `/Zi` becomes a
+            # bogus `.../msys64/Zi` source path before cl.exe sees it.  MSVC
+            # accepts both slash and dash option spelling; use the latter to
+            # preserve the flag through MSYS2 argument conversion.
+            cflags.append("-Zi" if is_msvc(self) else "-g")
         return cflags
 
     def _get_ldflags(self):
         ldflags = []
         if self.settings.os == "Windows":
             ldflags.append(f'-LIBPATH:{self._deps_lib_path()}')
-            ldflags.append("//DEBUG")
+            # Use dash spelling for MSYS2 compatibility; link.exe accepts it
+            # and MSYS2 will not reinterpret it as a filesystem path.
+            ldflags.append("-DEBUG")
+            if self.options.get_safe("with_symbols", False):
+                ldflags.append("-DEBUG:FULL")
         else:
-            ldflags.append(f'-L{unix_path(self._deps_lib_path())}')
-        if self._is_cross_build and self.settings.os == "Windows":
+            ldflags.append(f'-L{unix_path(self, self._deps_lib_path())}')
+        if cross_building(self) and self.settings.os == "Windows":
             ldflags.append("-static")
+        # ffmpeg is pure C — don't link any C++ runtime into its shared libraries.
+        # ffmpeg is pure C — never link any C++ runtime.
+        # Without this, clang's -static-libstdc++ from the profile bakes libc++
+        # into the output, which contaminates processes that load them.
         if self.settings.os == "Linux":
-            ldflags.append("-static-libstdc++")
+            ldflags.append("-nostdlib++")
         return ldflags
 
     def _get_configure_args(self):
@@ -803,8 +1018,7 @@ class ffmpeg(ConanFile):
         if self.options.get_safe("with_videotoolbox"):
             hwaccels.append("videotoolbox")
 
-        return self._generate_configure_args(unix_path(self._ffmpeg_build_path), codecs, hwaccels, extra_args)
-
+        return self._generate_configure_args(unix_path(self, self._ffmpeg_build_path), codecs, hwaccels, extra_args)
 
     def _deps_include_path(self):
         return os.path.join(self._deps_root, 'include')
@@ -815,14 +1029,14 @@ class ffmpeg(ConanFile):
     def _deps_pkg_config_path(self):
         return os.path.join(self._deps_root, self.PKG_CONFIG_SUB_PATH)
 
-    def _setup_nvheaders(self, version_tag = "n12.2.72.0"):
+    def _setup_nvheaders(self):
         shutil.rmtree('nvheaders', ignore_errors=True)
 
         src_path = Path(os.path.join(".", "nvheaders")).absolute()
         self._get_source(DependenyComponent.NV, src_path)
 
         DST_PATH = Path(self._deps_root).absolute()
-        with tools.chdir(src_path):
+        with chdir(self, src_path):
             with open('Makefile', 'r') as fin:
                 lines = fin.readlines()
                 lines[0] = f"PREFIX = {DST_PATH}\n"
@@ -833,7 +1047,7 @@ class ffmpeg(ConanFile):
         tc.generate()
         autotools = Autotools(self, namespace='nvheaders')
 
-        with tools.chdir(src_path):
+        with chdir(self, src_path):
             autotools.make()
             autotools.install(args=["DESTDIR="])
         shutil.rmtree('nvheaders', ignore_errors=True)
@@ -888,14 +1102,14 @@ class ffmpeg(ConanFile):
                 if p.exists():
                     os.remove(p)
 
-            self.output.info(f"Building libvpl from source... crossbuild: {self._is_cross_build}")
+            self.output.info(f"Building libvpl from source... crossbuild: {cross_building(self)}")
             checkout_dir = f"{self.CHECKOUT_PATH_LIBVPL}_{build_type.lower()}"
             dst_path = Path(os.path.join(".", checkout_dir)).absolute()
             self._get_source(DependenyComponent.LIBVPL, dst_path)
 
             tc = CMakeToolchain(self)
             tc.variables["BUILD_SHARED_LIBS"] = False
-            tc.variables["CMAKE_INSTALL_PREFIX"] = unix_path(self._deps_root)
+            tc.variables["CMAKE_INSTALL_PREFIX"] = unix_path(self, self._deps_root)
             tc.variables["CMAKE_BUILD_TYPE"] = build_type
             tc.variables["INSTALL_EXAMPLES"] = False
             if is_msvc(self):
@@ -904,22 +1118,21 @@ class ffmpeg(ConanFile):
                     is_static = runtime == "static" or runtime.startswith("MT")
                     tc.variables["CMAKE_MSVC_RUNTIME_LIBRARY"] = "MultiThreaded$<$<CONFIG:Debug>:Debug>" if is_static else "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
                     tc.variables["CMAKE_POLICY_DEFAULT_CMP0091"] = "NEW"
-            if self._is_cross_build:
+            if cross_building(self) and self.settings.os == "Windows":
                 # cross-compile to Windows/MSYS2
                 tc.variables["CMAKE_SYSTEM_NAME"] = "Windows"
                 tc.variables["CMAKE_C_COMPILER"] = "x86_64-w64-mingw32-gcc"
                 tc.variables["CMAKE_CXX_COMPILER"] = "x86_64-w64-mingw32-g++"
                 tc.variables["CMAKE_RC_COMPILER"] = "x86_64-w64-mingw32-windres"
 
-            tc.generate()
-            cmake = CMake(self)
-
             # 2) Generate a CMake toolchain in the 'libvpl' namespace
             build_dir = os.path.join(dst_path.absolute(), 'build')
             os.makedirs(build_dir, exist_ok=True)
             original_build_dir = self.folders.base_build
             self.folders.set_base_build(build_dir)
-            with tools.chdir(build_dir):
+            tc.generate()
+            cmake = CMake(self)
+            with chdir(self, build_dir):
                 self.output.info(f"cmake configure with build_script_path={dst_path.absolute()}")
                 cmake.configure(build_script_folder=dst_path.absolute(), variables=tc.variables)
                 cmake.build(build_type=build_type)
@@ -951,7 +1164,7 @@ class ffmpeg(ConanFile):
         self.output.info(f"Building libva from source...")
         dst_path = Path(os.path.join(".", self.CHECKOUT_PATH_LIBVA)).absolute()
         self._get_source(DependenyComponent.LIBVA, dst_path)
-        with tools.chdir(dst_path):
+        with chdir(self, dst_path):
             self.run(f"./autogen.sh --prefix={self._deps_root} --libdir={self._deps_lib_path()} --with-drivers-path=/usr/lib/dri")
             self.run("make")
             self.run("make install")
@@ -963,7 +1176,7 @@ class ffmpeg(ConanFile):
         dst_path = Path(os.path.join(".", self.CHECKOUT_PATH_LIBVDPAU)).absolute()
         self._get_source(DependenyComponent.LIBVDPAU, dst_path)
 
-        with tools.chdir(dst_path):
+        with chdir(self, dst_path):
             self.run(f"meson setup builddir")
             self.run(f"meson configure builddir -Dprefix={self._deps_root} -Dbindir=bin -Ddatadir=share -Dincludedir=include -Dlibdir=lib -Dlibexecdir=libexec -Dbuildtype=release -Ddebug=false")
             self.run("meson compile -C builddir")
@@ -1013,7 +1226,7 @@ class ffmpeg(ConanFile):
             f'--arch={self._target_arch}',
         ]
         args.extend(extra_args)
-        if self._is_cross_build:
+        if cross_building(self):
             args.extend([
                 f'--target-os={self._target_os}',
                 '--enable-cross-compile',
@@ -1031,6 +1244,9 @@ class ffmpeg(ConanFile):
                 "--disable-mmx",
                 "--enable-debug",
             ])
+        elif self.options.get_safe("with_symbols", False):
+            # Keep Release optimizations; only request compiler debug data.
+            args.append("--enable-debug")
 
         if self.settings.os == "Macos":
             # Install names default to the conan build-tree's absolute lib
